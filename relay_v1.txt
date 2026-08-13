@@ -1,0 +1,1950 @@
+﻿// === RelayBot · V1.0 ===
+
+const VERSION = "V1.0";
+const TG_TIMEOUT_MS = 10000;
+const TG_MAX_RETRIES = 2;
+const COUNTALL_MAX_PAGES = 200;
+const HOT_UPDATE_TTL_MS = 15000;
+const HOT_UPDATE_CACHE_LIMIT = 2048;
+const TOPIC_LOCK_TTL = 60;
+const TOPIC_LOCK_WAIT_MS = 1200;
+const RATE_LIMIT_WINDOW_MS = 5000;
+const RATE_LIMIT_MAX = 5;
+const RATE_STATE_CACHE_TTL_MS = 60000;
+const RATE_STATE_CACHE_LIMIT = 2048;
+
+const KV_PREFIX = {
+    MSG: "msg_",
+    BAN: "ban_",
+    REMIND: "remind_",
+    TOPIC: "top_",
+    THREAD: "thr_",
+    UPD: "upd_",
+    SYS: "sys_",
+    VERIFY: "vfy_",
+    VWAIT: "vwait_"
+};
+
+const TTL = {
+    MSG: 172800,
+    COOLDOWN: 3600,
+    UPD: 86400,
+    INFLIGHT: 60,
+    VERIFY_WINDOW: 300,
+    ERRLOG: 2592000,
+    ORPHAN_MARK: 2592000,
+    DELETE_SHORT: 5,
+    DELETE_PANEL: 12
+};
+
+export const UI_TEXT = {
+    GUEST_BANNED: "⚠️ 您的消息已被拒收",
+    ADMIN_BANNED: "🚫 已永久物理拉黑该访客",
+    ADMIN_UNBANNED: "✅ 已解除物理拉黑",
+    GUEST_UNBANNED: "✅ 信息接收已恢复",
+    GUEST_RATE_LIMIT: "⚠️ 发送过快，请稍后再试。",
+    ORPHAN_WARN: "⚠️ [系统告警] 该包厢未绑定访客 UID。您可清理下行映射，等待旧访客来信自愈。",
+    STALE_TOPIC_WARN: "⚠️ 当前包厢已不是该访客的主包厢，系统已阻止下发并清理旧下行映射。请等待新包厢继续来信。",
+    ERR_UPD: "⚠️ [系统降级] 幂等印章落盘失败，可能重复推送",
+    VERIFY_PROMPT: (code) =>
+`🛡️ 请回复下面的验证码完成验证。
+
+验证码：${code}
+
+验证码有效期 5 分钟，区分大小写，包含字母、数字和符号。`,
+    VERIFY_START_WAIT: "⚠️ 你未完成验证，请输入上方验证码。",
+    VERIFY_WRONG: (code) =>
+`❌ 验证码错误，请重新输入。
+
+当前验证码：${code}
+
+验证码区分大小写，包含字母、数字和符号。`,
+    VERIFY_OK: "✅ 验证成功，现在可以直接发送消息。",
+    VERIFY_DONE: "✅ 你已完成验证，现在可以直接发送消息。",
+    ADMIN_VERIFY_RESET: "✅ 已重置该访客的验证状态。",
+    GUEST_VERIFY_RESET: "⚠️ 你的验证状态已被重置，请重新发送 /start 或 /开始 完成验证。",
+    VERIFY_EXPIRED: "❌ 验证码已过期，请重新发送 /start 或 /开始 获取新的验证码。",
+    VERIFY_NEED_START: "⚠️ 请先发送 /start 或 /开始 获取验证码。",
+    CMD_HELP:
+`📓 RelayBot 指令集 (${VERSION})
+
+💬 回复：进入包厢直接打字
+👁️ 修改：长按自己消息点[编辑]
+🗑️ 撤回：编辑为“撤回”
+🚫 封禁：包厢内发送 /ban 或 /拉黑
+✅ 解封：包厢内发送 /unban 或 /解封
+🔄 重验：包厢内发送 /resetverify 或 /重置验证
+📊 状态：发送 /status 或 /状态
+📚 报错：发送 /errors 或 /报错
+📓 帮助：发送 /help 或 /帮助
+⚙️ 设定：发送 /init 或 /初始化 重新收口命令作用域（隐藏维护指令）
+
+⚠️ 权限说明：
+1. 本系统严格校验 ADMIN_UID，仅最高指挥官本人可执行指令。
+2. 普通中文词不会触发指令，必须带 / 才会触发。
+3. 受 Telegram 群组机制影响，请勿使用“匿名管理员”模式发言。`,
+ANCHOR_TEXT:
+`🧭 RelayBot 控制面板
+
+版本：${VERSION}
+模式：Topic 包厢
+状态：正常运行
+
+💡 点击下方按钮，即可跳转至对应功能。`,
+};
+
+const UI_KEYBOARD = {
+    ADMIN_MAIN: {
+        inline_keyboard: [
+            [
+                { text: "📓 帮助", callback_data: "panel_help" },
+                { text: "📚 报错", callback_data: "panel_errors" }
+            ],
+            [
+                { text: "📊 状态", callback_data: "panel_status" }
+            ]
+        ]
+    },
+    ADMIN_BACK: {
+        inline_keyboard: [[
+            { text: "🔄 返回主面板", callback_data: "panel_home" }
+        ]]
+    },
+    REMOVE_REPLY: {
+        remove_keyboard: true
+    },
+    ORPHAN_FIX: (threadId) => ({
+        inline_keyboard: [[
+            { text: "🗑️ 清理下行映射 (等待自愈)", callback_data: `fix_orphan_${threadId}` }
+        ]]
+    })
+};
+
+const ERR_ROUTER = [
+    { match: "message can't be copied", action: "SILENT" },
+    { match: "message thread not found", action: "HEAL" },
+    { match: "bot was blocked by the user", action: "TERMINAL" },
+    { match: "user is deactivated", action: "TERMINAL" },
+    { match: "chat not found", action: "TERMINAL" },
+    { match: "not enough rights", action: "TERMINAL" }
+];
+
+function hashStr(str) {
+    const coreStr = String(str || "").replace(/\s+/g, " ").trim().slice(0, 300);
+    let hash = 0;
+    for (let i = 0; i < coreStr.length; i++) {
+        hash = Math.imul(31, hash) + coreStr.charCodeAt(i) | 0;
+    }
+    return Math.abs(hash).toString(16);
+}
+
+function orphanFixMarkKey(threadId) {
+    return KV_PREFIX.SYS + "orfix_" + threadId;
+}
+
+function adminAnchorKey() {
+    return KV_PREFIX.SYS + "admin_anchor";
+}
+
+function topicLockKey(uid) {
+    return KV_PREFIX.SYS + "tlock_" + uid;
+}
+
+function normalizeVerifyCode(value) {
+    return String(value || "").replace(/\s+/g, "").trim();
+}
+
+export function verifyTextWithCode(text, code) {
+    const codeAt = text.indexOf(code);
+    if (codeAt < 0) {
+        throw new Error(`[CORE] 验证码实体定位失败: ${String(code || "").slice(0, 32)}`);
+    }
+    return {
+        text,
+        entities: [{ type: "code", offset: codeAt, length: code.length }]
+    };
+}
+
+const ADMIN_PANEL_COMMANDS = {
+    STATUS: ["/status", "/状态"],
+    ERRORS: ["/errors", "/报错"],
+    INIT: ["/init", "/初始化"],
+    START: ["/start", "/开始", "/help", "/帮助"]
+};
+
+const TOPIC_ADMIN_COMMANDS = {
+    BAN: ["/ban", "/拉黑"],
+    UNBAN: ["/unban", "/解封"],
+    RESET_VERIFY: ["/resetverify", "/重置验证"]
+};
+
+const GUEST_COMMANDS = {
+    START: ["/start", "/开始"]
+};
+
+function normalizeCommand(value) {
+    const first = String(value || "").trim().split(/\s+/)[0].replace(/@[\w_]+$/, "");
+    return first.startsWith("/") ? first.toLowerCase() : "";
+}
+
+function isCommand(cmd, aliases) {
+    return aliases.includes(String(cmd || "").toLowerCase());
+}
+
+function pickRandomChar(chars) {
+    const bytes = new Uint32Array(1);
+    crypto.getRandomValues(bytes);
+    return chars[bytes[0] % chars.length];
+}
+
+function shuffleChars(chars) {
+    const arr = [...chars];
+    const bytes = new Uint32Array(arr.length);
+    crypto.getRandomValues(bytes);
+
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = bytes[i] % (i + 1);
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+
+    return arr.join("");
+}
+
+function makeVerifyCode() {
+    const upperChars = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const lowerChars = "abcdefghijkmnpqrstuvwxyz";
+    const numberChars = "23456789";
+    const symbolChars = "!$%&_-";
+    const allChars = upperChars + lowerChars + numberChars + symbolChars;
+
+    const chars = [
+        pickRandomChar(upperChars),
+        pickRandomChar(lowerChars),
+        pickRandomChar(numberChars),
+        pickRandomChar(symbolChars),
+        pickRandomChar(allChars),
+        pickRandomChar(allChars)
+    ];
+
+    return shuffleChars(chars);
+}
+
+
+function parseVerifyState(raw) {
+    if (!raw) {
+        return { ok: false, donePrompted: false };
+    }
+
+    try {
+        const parsed = JSON.parse(raw);
+        return {
+            ok: !!parsed?.ok,
+            donePrompted: !!parsed?.donePrompted
+        };
+    } catch (e) {
+        return { ok: false, donePrompted: false };
+    }
+}
+
+function isVerifiedState(state) {
+    return !!state?.ok;
+}
+
+function serializeVerifyState(state) {
+    return JSON.stringify({
+        ok: !!state?.ok,
+        donePrompted: !!state?.donePrompted
+    });
+}
+
+function parseVerifyWaitState(raw) {
+    if (!raw) return null;
+
+    try {
+        const parsed = JSON.parse(raw);
+        return {
+            startWarned: !!parsed?.startWarned,
+            wrongWarnCount: Math.max(0, Number(parsed?.wrongWarnCount || 0) || 0),
+            expiredWarnCount: Math.max(0, Number(parsed?.expiredWarnCount || 0) || 0),
+            code: normalizeVerifyCode(parsed?.code || ""),
+            expiresAt: Number(parsed?.expiresAt || 0)
+        };
+    } catch (e) {
+        return {
+            startWarned: false,
+            wrongWarnCount: 0,
+            expiredWarnCount: 0,
+            code: "",
+            expiresAt: 0
+        };
+    }
+}
+
+function isVerifyWaitActive(state) {
+    if (!state) return false;
+    if (!state.expiresAt) return true;
+    return Date.now() <= state.expiresAt;
+}
+
+function buildVerifyWaitState(
+    code = "",
+    expiresAt = Date.now() + TTL.VERIFY_WINDOW * 1000,
+    startWarned = false,
+    wrongWarnCount = 0,
+    expiredWarnCount = 0
+) {
+    return {
+        startWarned: !!startWarned,
+        wrongWarnCount: Math.max(0, Number(wrongWarnCount || 0) || 0),
+        expiredWarnCount: Math.max(0, Number(expiredWarnCount || 0) || 0),
+        code: normalizeVerifyCode(code),
+        expiresAt: Number(expiresAt || 0)
+    };
+}
+
+function serializeVerifyWaitState(state) {
+    return JSON.stringify(buildVerifyWaitState(
+        state?.code,
+        state?.expiresAt,
+        state?.startWarned,
+        state?.wrongWarnCount,
+        state?.expiredWarnCount
+    ));
+}
+
+function verifyWaitTtl() {
+    return TTL.VERIFY_WINDOW + TTL.COOLDOWN;
+}
+
+const HOT_UPDATE_CACHE = new Map();
+const RATE_STATE_CACHE = new Map();
+const VERIFY_NEED_START_CACHE = new Map();
+
+function cleanupVerifyNeedStartCache(now = Date.now()) {
+    for (const [key, value] of VERIFY_NEED_START_CACHE) {
+        if (!value || (now - Number(value.ts || 0)) > TTL.VERIFY_WINDOW * 1000) {
+            VERIFY_NEED_START_CACHE.delete(key);
+        }
+    }
+}
+
+function shouldSendNeedStart(uid) {
+    const key = String(uid || "").trim();
+    if (!key) return false;
+
+    const now = Date.now();
+    cleanupVerifyNeedStartCache(now);
+
+    const old = VERIFY_NEED_START_CACHE.get(key) || { count: 0, ts: now };
+    const count = Number(old.count || 0);
+    VERIFY_NEED_START_CACHE.set(key, { count: count + 1, ts: now });
+
+    return count < 1;
+}
+
+function clearNeedStartWarn(uid) {
+    const key = String(uid || "").trim();
+    if (key) VERIFY_NEED_START_CACHE.delete(key);
+}
+
+function cleanupHotUpdateCache(now = Date.now()) {
+    for (const [key, value] of HOT_UPDATE_CACHE) {
+        if (!value || (now - Number(value.ts || 0)) > HOT_UPDATE_TTL_MS) {
+            HOT_UPDATE_CACHE.delete(key);
+        }
+    }
+
+    if (HOT_UPDATE_CACHE.size <= HOT_UPDATE_CACHE_LIMIT) return;
+
+    const entries = Array.from(HOT_UPDATE_CACHE.entries()).sort(
+        (a, b) => Number(a[1]?.ts || 0) - Number(b[1]?.ts || 0)
+    );
+    const overflow = HOT_UPDATE_CACHE.size - HOT_UPDATE_CACHE_LIMIT;
+
+    for (let i = 0; i < overflow; i++) {
+        HOT_UPDATE_CACHE.delete(entries[i][0]);
+    }
+}
+
+function getHotUpdateState(updateId) {
+    const key = String(updateId ?? "").trim();
+    if (!key) return "";
+
+    const now = Date.now();
+    cleanupHotUpdateCache(now);
+
+    const entry = HOT_UPDATE_CACHE.get(key);
+    if (!entry) return "";
+
+    if ((now - Number(entry.ts || 0)) > HOT_UPDATE_TTL_MS) {
+        HOT_UPDATE_CACHE.delete(key);
+        return "";
+    }
+
+    return String(entry.state || "");
+}
+
+function setHotUpdateState(updateId, state) {
+    const key = String(updateId ?? "").trim();
+    if (!key) return;
+
+    const now = Date.now();
+    HOT_UPDATE_CACHE.set(key, { state: String(state || ""), ts: now });
+    cleanupHotUpdateCache(now);
+}
+
+function clearHotUpdateState(updateId) {
+    const key = String(updateId ?? "").trim();
+    if (!key) return;
+    HOT_UPDATE_CACHE.delete(key);
+}
+
+function cleanupRateStateCache(now = Date.now()) {
+    for (const [key, value] of RATE_STATE_CACHE) {
+        if (!value || (now - Number(value.touched || value.start || 0)) > RATE_STATE_CACHE_TTL_MS) {
+            RATE_STATE_CACHE.delete(key);
+        }
+    }
+
+    if (RATE_STATE_CACHE.size <= RATE_STATE_CACHE_LIMIT) return;
+
+    const entries = Array.from(RATE_STATE_CACHE.entries()).sort(
+        (a, b) => Number(a[1]?.touched || a[1]?.start || 0) - Number(b[1]?.touched || b[1]?.start || 0)
+    );
+    const overflow = RATE_STATE_CACHE.size - RATE_STATE_CACHE_LIMIT;
+
+    for (let i = 0; i < overflow; i++) {
+        RATE_STATE_CACHE.delete(entries[i][0]);
+    }
+}
+
+function errorLogPrefix() {
+    return KV_PREFIX.SYS + "errlog_";
+}
+
+function errorLogEntryKey(level, text) {
+    return errorLogPrefix() + Date.now() + "_" + hashStr(`${level}:${text}`) + "_" + Math.random().toString(36).slice(2, 6);
+}
+
+export default {
+    async fetch(request, env, ctx) {
+        const { BOT_TOKEN, MY_ID, ADMIN_UID, SECRET_TOKEN, KV } = env;
+
+        if (!KV) {
+            return new Response("KV binding missing", { status: 500 });
+        }
+
+        if (request.method !== "POST") {
+            return new Response("RelayBot Standby");
+        }
+
+        function sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        async function tg(method, params, retries = TG_MAX_RETRIES) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), TG_TIMEOUT_MS);
+
+            try {
+                const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(params),
+                    signal: controller.signal
+                });
+
+                const raw = await res.text();
+                let json;
+                try {
+                    json = JSON.parse(raw);
+                } catch (e) {
+                    return { ok: false, description: `Telegram 非 JSON 响应 (HTTP ${res.status})` };
+                }
+
+                if (!json.ok && Number(json.error_code || 0) === 429 && retries > 0) {
+                    const waitMs = Math.max(1, Number(json.parameters?.retry_after || 5)) * 1000;
+                    await sleep(waitMs);
+                    return tg(method, params, retries - 1);
+                }
+
+                return json;
+            } catch (e) {
+                if (e?.name === "AbortError") {
+                    return { ok: false, description: `Fetch超时(${TG_TIMEOUT_MS}ms)` };
+                }
+                return { ok: false, description: "Fetch网络断开或超时" };
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        function normalizeThreadId(threadId) {
+            const raw = String(threadId ?? "").trim();
+            if (!/^\d+$/.test(raw)) return "";
+            const n = Number(raw);
+            if (!Number.isSafeInteger(n) || n <= 0) return "";
+            return String(n);
+        }
+
+        function isValidThreadId(threadId) {
+            return !!normalizeThreadId(threadId);
+        }
+
+        function withRequiredThread(base, threadId, context = "Topic") {
+            const tid = normalizeThreadId(threadId);
+            if (!tid) {
+                throw new Error(`[CORE] ${context} 缺少有效 Topic ID，已阻止消息落入总控制室`);
+            }
+            return { ...base, message_thread_id: Number(tid) };
+        }
+
+        async function assertForwardLandedInThread(res, expectedThreadId, uid, phase) {
+            if (!res?.ok) return;
+            const expected = normalizeThreadId(expectedThreadId);
+            const actual = normalizeThreadId(res?.result?.message_thread_id);
+
+            if (!expected || actual === expected) return;
+
+            const wrongMsgId = res?.result?.message_id;
+            if (wrongMsgId) {
+                ctx.waitUntil(deleteMessageNow(MY_ID, wrongMsgId));
+            }
+
+            throw new Error(`[CORE] ${phase}(UID:${uid})疑似落入总控制室，系统已阻止继续处理`);
+        }
+
+        function parseErr(res) {
+            const desc = String(res?.description || "未知错误");
+            for (const rule of ERR_ROUTER) {
+                if (desc.includes(rule.match)) return { action: rule.action, desc };
+            }
+            const code = Number(res?.error_code || 0);
+            return { action: (code === 400 || code === 403) ? "TERMINAL" : "CORE", desc };
+        }
+
+        async function deleteMessageNow(chatId, messageId) {
+            if (!chatId || !messageId) return;
+            try {
+                await tg("deleteMessage", {
+                    chat_id: chatId,
+                    message_id: messageId
+                });
+            } catch (e) {
+                // best-effort
+            }
+        }
+
+        async function deleteTopicNow(threadId) {
+            if (!threadId) return;
+            try {
+                await tg("deleteForumTopic", {
+                    chat_id: MY_ID,
+                    message_thread_id: Number(threadId)
+                });
+            } catch (e) {
+                // best-effort
+            }
+        }
+
+        function deleteLater(chatId, messageId, delaySeconds) {
+            if (!chatId || !messageId || !delaySeconds) return;
+            ctx.waitUntil((async () => {
+                try {
+                    await sleep(delaySeconds * 1000);
+                    await tg("deleteMessage", {
+                        chat_id: chatId,
+                        message_id: messageId
+                    });
+                } catch (e) {
+                    // best-effort
+                }
+            })());
+        }
+
+        async function safeEditMessageText(chatId, messageId, text, replyMarkup) {
+            const params = {
+                chat_id: chatId,
+                message_id: messageId,
+                text
+            };
+            if (replyMarkup !== undefined) {
+                params.reply_markup = replyMarkup;
+            }
+            return tg("editMessageText", params);
+        }
+
+        async function sendControlMessage(params, deleteAfterSeconds = 0) {
+            const res = await tg("sendMessage", params);
+            if (res.ok && res.result?.message_id && deleteAfterSeconds > 0) {
+                deleteLater(params.chat_id, res.result.message_id, deleteAfterSeconds);
+            }
+            return res;
+        }
+
+        async function isGuestRateLimited(uid) {
+            const key = String(uid || "").trim();
+            if (!key) return false;
+
+            const now = Date.now();
+            cleanupRateStateCache(now);
+
+            let nextState = { start: now, count: 1, warned: false, touched: now };
+            const oldState = RATE_STATE_CACHE.get(key);
+
+            if (oldState) {
+                const start = Number(oldState.start || 0);
+                const count = Number(oldState.count || 0);
+                const warned = !!oldState.warned;
+
+                if (start > 0 && (now - start) <= RATE_LIMIT_WINDOW_MS) {
+                    nextState = { start, count: count + 1, warned, touched: now };
+                }
+            }
+
+            let shouldWarn = false;
+            if (nextState.count > RATE_LIMIT_MAX && !nextState.warned) {
+                nextState.warned = true;
+                shouldWarn = true;
+            }
+
+            RATE_STATE_CACHE.set(key, nextState);
+
+            if (nextState.count <= RATE_LIMIT_MAX) {
+                return false;
+            }
+
+            if (shouldWarn) {
+                ctx.waitUntil(tg("sendMessage", {
+                    chat_id: uid,
+                    text: UI_TEXT.GUEST_RATE_LIMIT
+                }));
+            }
+
+            return true;
+        }
+
+        function formatErrTime() {
+            const parts = new Intl.DateTimeFormat("en-CA", {
+                timeZone: "Asia/Taipei",
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+                hour12: false
+            }).formatToParts(new Date());
+
+            const map = {};
+            for (const p of parts) {
+                if (p.type !== "literal") map[p.type] = p.value;
+            }
+            return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second} Asia/Taipei`;
+        }
+
+        async function pushErrorLog(level, text) {
+            const firstLine = String(text || "未知错误").split("\n")[0].slice(0, 220);
+            const entry = `[${formatErrTime()}] ${level} ${firstLine}`;
+
+            try {
+                await KV.put(errorLogEntryKey(level, text), entry, { expirationTtl: TTL.ERRLOG });
+            } catch (e) {
+                console.error("错误滚动日志写入失败", e);
+            }
+        }
+
+        async function getRecentErrorLogs() {
+            try {
+                const keys = [];
+                let cursor = undefined;
+                let pages = 0;
+
+                while (true) {
+                    pages++;
+                    if (pages > COUNTALL_MAX_PAGES) break;
+
+                    const page = await KV.list({ prefix: errorLogPrefix(), cursor });
+                    for (const item of page.keys || []) {
+                        if (item?.name) keys.push(String(item.name));
+                    }
+
+                    if (page.list_complete) break;
+                    cursor = page.cursor;
+                    if (!cursor) break;
+                }
+
+                const recentKeys = keys.sort().reverse().slice(0, 5);
+                const values = await Promise.all(recentKeys.map((key) => KV.get(key)));
+                return values.filter(Boolean).map((value) => String(value));
+            } catch (e) {
+                console.error("错误滚动日志读取失败", e);
+                return [];
+            }
+        }
+
+        async function countAll(prefix) {
+            let total = 0;
+            let cursor = undefined;
+            let pages = 0;
+
+            while (true) {
+                pages++;
+                if (pages > COUNTALL_MAX_PAGES) {
+                    console.warn(`countAll page cap reached for prefix=${prefix}`);
+                    break;
+                }
+
+                const page = await KV.list({ prefix, cursor });
+                total += (page.keys || []).length;
+
+                if (page.list_complete) break;
+                cursor = page.cursor;
+                if (!cursor) break;
+            }
+
+            return total;
+        }
+
+        async function buildAdminStatusText() {
+            const banCount = await countAll(KV_PREFIX.BAN);
+            let lastErr = "暂无记录";
+            try {
+                const recentLogs = await getRecentErrorLogs();
+                lastErr = recentLogs[0] || "暂无记录";
+            } catch (e) {
+                // best-effort
+            }
+
+            return `🟢 RelayBot 运行正常
+🔖 版本：${VERSION}
+📦 主线：Topic 包厢模式
+🚫 黑名单：${banCount} 人
+⚠️ 最终报错：${lastErr}`;
+        }
+
+        async function buildAdminErrorsText() {
+            const recentLogs = await getRecentErrorLogs();
+            return recentLogs.length
+                ? `📚 最近 5 条报错滚动日志\n\n${recentLogs.map((item, idx) => `${idx + 1}. ${item}`).join("\n\n")}`
+                : "📚 最近 5 条报错滚动日志\n\n暂无记录";
+        }
+
+        async function ensureTopicReady(threadId) {
+            await sleep(350);
+            const probe = await tg("sendChatAction", {
+                chat_id: MY_ID,
+                message_thread_id: Number(threadId),
+                action: "typing"
+            });
+            if (probe.ok) return true;
+
+            if (String(probe?.description || "").includes("message thread not found")) {
+                await sleep(500);
+                const probe2 = await tg("sendChatAction", {
+                    chat_id: MY_ID,
+                    message_thread_id: Number(threadId),
+                    action: "typing"
+                });
+                return !!probe2.ok;
+            }
+
+            return false;
+        }
+
+        function parseAdminAnchorRecord(raw) {
+            if (!raw) return null;
+
+            try {
+                const data = JSON.parse(raw);
+                const messageId = Number(data?.message_id || 0);
+                if (!messageId) return null;
+
+                return {
+                    message_id: messageId,
+                    created_at: Number(data?.created_at || 0) || 0
+                };
+            } catch (e) {
+                const messageId = Number(raw || 0);
+                return messageId ? { message_id: messageId, created_at: 0 } : null;
+            }
+        }
+
+        async function putAdminAnchorRecord(messageId) {
+            if (!messageId) return;
+            try {
+                await KV.put(adminAnchorKey(), JSON.stringify({
+                    message_id: Number(messageId),
+                    created_at: Date.now()
+                }));
+            } catch (e) {
+                // best-effort
+            }
+        }
+
+        async function retireAdminPanelMessage(messageId) {
+            const oldMessageId = Number(messageId || 0);
+            if (!oldMessageId) return;
+
+            try {
+                const delRes = await tg("deleteMessage", {
+                    chat_id: MY_ID,
+                    message_id: oldMessageId
+                });
+
+                if (delRes.ok) return;
+            } catch (e) {
+                // continue to retire fallback
+            }
+
+            try {
+                await safeEditMessageText(
+                    MY_ID,
+                    oldMessageId,
+`🧭 旧控制面板已退役
+
+请使用最新的 RelayBot 控制面板。`
+                );
+
+                try {
+                    await tg("editMessageReplyMarkup", {
+                        chat_id: MY_ID,
+                        message_id: oldMessageId,
+                        reply_markup: { inline_keyboard: [] }
+                    });
+                } catch (e) {
+                    // best-effort
+                }
+            } catch (e) {
+                // best-effort
+            }
+        }
+
+        async function sendAdminAnchor() {
+            const res = await tg("sendMessage", {
+                chat_id: MY_ID,
+                text: UI_TEXT.ANCHOR_TEXT,
+                disable_notification: true,
+                reply_markup: UI_KEYBOARD.ADMIN_MAIN
+            });
+
+            if (res.ok && res.result?.message_id) {
+                await putAdminAnchorRecord(res.result.message_id);
+            }
+
+            return res;
+        }
+
+        async function recreateAdminAnchor() {
+            try {
+                const oldRecord = parseAdminAnchorRecord(await KV.get(adminAnchorKey()));
+                if (oldRecord?.message_id) {
+                    await retireAdminPanelMessage(oldRecord.message_id);
+                }
+            } catch (e) {
+                // best-effort
+            }
+
+            return sendAdminAnchor();
+        }
+
+        async function ensureAdminAnchor() {
+            try {
+                const raw = await KV.get(adminAnchorKey());
+                if (!parseAdminAnchorRecord(raw)) {
+                    return sendAdminAnchor();
+                }
+            } catch (e) {
+                // best-effort
+            }
+            return { ok: true };
+        }
+
+        async function isUsablePanelCallback(cq) {
+            const messageId = Number(cq?.message?.message_id || 0);
+            if (!messageId) return true;
+
+            let current = null;
+            try {
+                current = parseAdminAnchorRecord(await KV.get(adminAnchorKey()));
+            } catch (e) {
+                current = null;
+            }
+
+            if (!current?.message_id) {
+                await putAdminAnchorRecord(messageId);
+                return true;
+            }
+
+            if (Number(current.message_id) === messageId) {
+                return true;
+            }
+
+            await retireAdminPanelMessage(messageId);
+            ctx.waitUntil(tg("answerCallbackQuery", {
+                callback_query_id: cq.id,
+                text: "这是旧控制面板，请使用最新面板。",
+                show_alert: true
+            }));
+            return false;
+        }
+
+        const AlertBus = {
+            coolKey(dedupeKey) {
+                return KV_PREFIX.SYS + "cd_" + dedupeKey;
+            },
+            inflightKey(dedupeKey) {
+                return KV_PREFIX.SYS + "if_" + dedupeKey;
+            },
+            resolveLevel(text, isCore) {
+                if (String(text).startsWith("🚨 RelayBot 主链路崩溃重试")) return "CORE";
+                if (String(text).startsWith("🚨 RelayBot 终端熔断告警")) return "TERMINAL";
+                if (String(text).startsWith("⚠️ RelayBot 系统降级告警")) return "WARN";
+                if (String(text).startsWith("🚨 RelayBot 未知系统崩溃")) return "UNKNOWN";
+                return isCore ? "CORE" : "WARN";
+            },
+            async recordLast(text, isCore) {
+                await pushErrorLog(this.resolveLevel(text, isCore), text);
+            },
+            async emit(text, isCore) {
+                await this.recordLast(text, isCore);
+
+                const prefix = (text.startsWith("🚨") || text.startsWith("⚠️"))
+                    ? ""
+                    : `🚨 RelayBot 告警 (${isCore ? "主链路" : "降级"})\n\n`;
+
+                const res = await tg("sendMessage", {
+                    chat_id: MY_ID,
+                    text: prefix + text
+                });
+
+                if (!res.ok) {
+                    throw new Error(`AlertBus emit failed: ${res.description || "unknown"}`);
+                }
+            },
+            dispatch(text, dedupeKey, isCore = false) {
+                const job = (async () => {
+                    const cdKey = this.coolKey(dedupeKey);
+                    const ifKey = this.inflightKey(dedupeKey);
+                    let inflightLocked = false;
+
+                    try {
+                        const [hasCooldown, hasInflight] = await Promise.all([KV.get(cdKey), KV.get(ifKey)]);
+                        if (hasCooldown || hasInflight) return;
+                    } catch (e) {
+                        console.error("AlertBus precheck failed", e);
+                    }
+
+                    try {
+                        await KV.put(ifKey, "1", { expirationTtl: TTL.INFLIGHT });
+                        inflightLocked = true;
+                    } catch (e) {
+                        console.error("AlertBus inflight lock failed", e);
+                    }
+
+                    try {
+                        await this.emit(text, isCore);
+
+                        try {
+                            await KV.put(cdKey, "1", { expirationTtl: TTL.COOLDOWN });
+                        } catch (e) {
+                            console.error("AlertBus cooldown write failed", e);
+                        }
+                    } catch (e) {
+                        console.error("AlertBus emit failed", e);
+                    } finally {
+                        if (inflightLocked) {
+                            try {
+                                await KV.delete(ifKey);
+                            } catch (e) {
+                                console.error("AlertBus inflight unlock failed", e);
+                            }
+                        }
+                    }
+                })();
+
+                ctx.waitUntil(job);
+            }
+        };
+
+        const botTokenStr = String(BOT_TOKEN || "").trim();
+        const myIdStr = String(MY_ID || "").trim();
+        const adminUidStr = String(ADMIN_UID || "").trim();
+        const secretTokenStr = String(SECRET_TOKEN || "").trim();
+
+        if (!botTokenStr) {
+            return new Response("BOT_TOKEN Misconfigured", { status: 500 });
+        }
+
+        if (!/^-?\d+$/.test(myIdStr)) {
+            return new Response("MY_ID Misconfigured", { status: 500 });
+        }
+
+        if (!/^\d+$/.test(adminUidStr)) {
+            AlertBus.dispatch(
+                "⛔ 严重配置错误：环境变量 ADMIN_UID 未配置或格式不正确！系统已强制锁定保护。",
+                "config_admin_uid_misconfigured",
+                true
+            );
+            return new Response("ADMIN_UID Misconfigured", { status: 500 });
+        }
+
+        if (!/^[A-Za-z0-9_-]{1,256}$/.test(secretTokenStr)) {
+            return new Response("SECRET_TOKEN Misconfigured", { status: 500 });
+        }
+
+        if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== SECRET_TOKEN) {
+            return new Response("Denied", { status: 403 });
+        }
+
+        let b;
+
+        try {
+            b = await request.json();
+
+            if (b.update_id !== undefined) {
+                const hotState = getHotUpdateState(b.update_id);
+                if (hotState === "inflight" || hotState === "done") {
+                    return new Response("OK");
+                }
+
+                setHotUpdateState(b.update_id, "inflight");
+
+                if (await KV.get(KV_PREFIX.UPD + b.update_id)) {
+                    setHotUpdateState(b.update_id, "done");
+                    return new Response("OK");
+                }
+            }
+
+            const processUpdate = async () => {
+                if (b.callback_query) {
+                    const cq = b.callback_query;
+
+                    if (String(cq.from?.id) !== adminUidStr) {
+                        ctx.waitUntil(tg("answerCallbackQuery", {
+                            callback_query_id: cq.id,
+                            text: "⛔ 越权操作已被拦截",
+                            show_alert: true
+                        }));
+                        return;
+                    }
+
+                    if (["panel_home", "panel_status", "panel_help", "panel_errors"].includes(cq.data)) {
+                        if (!(await isUsablePanelCallback(cq))) return;
+                    }
+
+                    if (cq.data === "panel_home") {
+                        await safeEditMessageText(
+                            MY_ID,
+                            cq.message.message_id,
+                            UI_TEXT.ANCHOR_TEXT,
+                            UI_KEYBOARD.ADMIN_MAIN
+                        );
+                        ctx.waitUntil(tg("answerCallbackQuery", {
+                            callback_query_id: cq.id,
+                            text: "已返回面板"
+                        }));
+                        return;
+                    }
+
+                    if (cq.data === "panel_status") {
+                        await safeEditMessageText(
+                            MY_ID,
+                            cq.message.message_id,
+                            await buildAdminStatusText(),
+                            UI_KEYBOARD.ADMIN_BACK
+                        );
+                        ctx.waitUntil(tg("answerCallbackQuery", {
+                            callback_query_id: cq.id,
+                            text: "状态已刷新"
+                        }));
+                        return;
+                    }
+
+                    if (cq.data === "panel_help") {
+                        await safeEditMessageText(
+                            MY_ID,
+                            cq.message.message_id,
+                            UI_TEXT.CMD_HELP,
+                            UI_KEYBOARD.ADMIN_BACK
+                        );
+                        ctx.waitUntil(tg("answerCallbackQuery", {
+                            callback_query_id: cq.id,
+                            text: "已打开帮助"
+                        }));
+                        return;
+                    }
+
+                    if (cq.data === "panel_errors") {
+                        await safeEditMessageText(
+                            MY_ID,
+                            cq.message.message_id,
+                            await buildAdminErrorsText(),
+                            UI_KEYBOARD.ADMIN_BACK
+                        );
+                        ctx.waitUntil(tg("answerCallbackQuery", {
+                            callback_query_id: cq.id,
+                            text: "报错日志已刷新"
+                        }));
+                        return;
+                    }
+
+                    if (cq.data && cq.data.startsWith("fix_orphan_")) {
+                        const topicId = cq.data.slice("fix_orphan_".length);
+
+                        try {
+                            await Promise.all([
+                                KV.delete(KV_PREFIX.THREAD + topicId),
+                                KV.put(orphanFixMarkKey(topicId), "1", { expirationTtl: TTL.ORPHAN_MARK })
+                            ]);
+                        } catch (err) {
+                            throw new Error(`[CORE] 孤儿映射(Topic:${topicId})清理失败: ${err.message}`);
+                        }
+
+                        const editRes = await safeEditMessageText(
+                            MY_ID,
+                            cq.message.message_id,
+                            "✅ 当前包厢的下行映射已清理。旧访客下次来信时，系统将自动重建新包厢。"
+                        );
+
+                        if (editRes.ok) {
+                            deleteLater(MY_ID, cq.message.message_id, TTL.DELETE_SHORT);
+                        }
+
+                        ctx.waitUntil(tg("answerCallbackQuery", {
+                            callback_query_id: cq.id,
+                            text: "下行映射已清理"
+                        }));
+                    }
+                    return;
+                }
+
+                if (b.edited_message) {
+                    const em = b.edited_message;
+
+                    if (String(em.from?.id) !== adminUidStr) return;
+
+                    const eText = (em.text || em.caption || "").trim();
+                    if (String(em.chat.id) === String(MY_ID) && eText) {
+                        const map = await KV.get(KV_PREFIX.MSG + em.message_id);
+                        if (map && map.includes("_")) {
+                            const [targetId, targetMsgId] = map.split("_");
+                            let res;
+
+                            if (eText === "撤回") {
+                                res = await tg("deleteMessage", {
+                                    chat_id: targetId,
+                                    message_id: targetMsgId
+                                });
+                            } else if (em.text) {
+                                res = await tg("editMessageText", {
+                                    chat_id: targetId,
+                                    message_id: targetMsgId,
+                                    text: eText
+                                });
+                            } else {
+                                res = await tg("editMessageCaption", {
+                                    chat_id: targetId,
+                                    message_id: targetMsgId,
+                                    caption: eText
+                                });
+                            }
+
+                            if (!res.ok) {
+                                const err = parseErr(res);
+                                if (err.action === "SILENT") return;
+                                if (err.action === "CORE") {
+                                    throw new Error(`[CORE] 上帝视角(Target:${targetId})操作失败: ${err.desc}`);
+                                }
+                                AlertBus.dispatch(
+                                    `上帝视角(Target:${targetId})降级错误: ${err.desc}`,
+                                    `edit_${targetId}`
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                const msg = b.message;
+                if (!msg) return;
+
+                const chatId = String(msg.chat.id);
+                const rawText = (msg.text || msg.caption || "").trim();
+                const cmd = normalizeCommand(rawText);
+
+                if (chatId === String(MY_ID)) {
+                    if (String(msg.from?.id) !== adminUidStr) return;
+
+                    if (isCommand(cmd, ADMIN_PANEL_COMMANDS.STATUS)) {
+                        await ensureAdminAnchor();
+
+                        const botMsg = await sendControlMessage({
+                            chat_id: MY_ID,
+                            text: await buildAdminStatusText(),
+                            reply_markup: UI_KEYBOARD.REMOVE_REPLY
+                        }, TTL.DELETE_PANEL);
+
+                        if (botMsg.ok) {
+                            await deleteMessageNow(MY_ID, msg.message_id);
+                        }
+                        return;
+                    }
+
+                    if (isCommand(cmd, ADMIN_PANEL_COMMANDS.ERRORS)) {
+                        await ensureAdminAnchor();
+
+                        const botMsg = await sendControlMessage({
+                            chat_id: MY_ID,
+                            text: await buildAdminErrorsText(),
+                            reply_markup: UI_KEYBOARD.REMOVE_REPLY
+                        }, TTL.DELETE_PANEL);
+
+                        if (botMsg.ok) {
+                            await deleteMessageNow(MY_ID, msg.message_id);
+                        }
+                        return;
+                    }
+
+                    if (isCommand(cmd, ADMIN_PANEL_COMMANDS.INIT)) {
+                        await tg("deleteMyCommands", { scope: { type: "all_private_chats" } });
+                        await tg("deleteMyCommands", { scope: { type: "all_group_chats" } });
+                        await tg("deleteMyCommands", { scope: { type: "all_chat_administrators" } });
+                        await tg("deleteMyCommands", { scope: { type: "chat", chat_id: MY_ID } });
+                        await tg("deleteMyCommands", { scope: { type: "chat_administrators", chat_id: MY_ID } });
+                        await tg("deleteMyCommands", {
+                            scope: {
+                                type: "chat_member",
+                                chat_id: MY_ID,
+                                user_id: Number(adminUidStr)
+                            }
+                        });
+
+                        await tg("setMyCommands", {
+                            commands: [
+                                { command: "start", description: "打开控制面板" },
+                                { command: "ban", description: "拉黑当前访客" },
+                                { command: "unban", description: "解封当前访客" },
+                                { command: "resetverify", description: "重置当前访客验证" }
+                            ],
+                            scope: {
+                                type: "chat_member",
+                                chat_id: MY_ID,
+                                user_id: Number(adminUidStr)
+                            }
+                        });
+
+                        await recreateAdminAnchor();
+
+                        const botMsg = await sendControlMessage({
+                            chat_id: MY_ID,
+                            text: "✅ 命令作用域已收窄：菜单仅显示 /start、/ban、/unban、/resetverify。/init、/初始化、/errors、/报错 为隐藏维护指令。",
+                            reply_markup: UI_KEYBOARD.REMOVE_REPLY
+                        }, TTL.DELETE_SHORT);
+
+                        if (botMsg.ok) {
+                            await deleteMessageNow(MY_ID, msg.message_id);
+                        }
+                        return;
+                    }
+
+                    if (isCommand(cmd, ADMIN_PANEL_COMMANDS.START)) {
+                        await recreateAdminAnchor();
+                        await deleteMessageNow(MY_ID, msg.message_id);
+                        return;
+                    }
+
+                    if (msg.is_topic_message && msg.message_thread_id) {
+                        const topicId = String(msg.message_thread_id);
+                        const targetUid = await KV.get(KV_PREFIX.THREAD + topicId);
+
+                        if (!targetUid) {
+                            const orphanCdKey = KV_PREFIX.SYS + "orphan_" + topicId;
+                            try {
+                                if (!(await KV.get(orphanCdKey))) {
+                                    await KV.put(orphanCdKey, "1", { expirationTtl: TTL.COOLDOWN });
+                                    await tg("sendMessage", {
+                                        chat_id: MY_ID,
+                                        message_thread_id: msg.message_thread_id,
+                                        text: UI_TEXT.ORPHAN_WARN,
+                                        reply_markup: UI_KEYBOARD.ORPHAN_FIX(msg.message_thread_id)
+                                    });
+                                }
+                            } catch (err) {
+                                AlertBus.dispatch(
+                                    `孤儿冷却锁(Topic:${topicId})写入失败: ${err.message}`,
+                                    `orphan_cd_${topicId}`
+                                );
+                            }
+                            return;
+                        }
+
+                        const canonicalTid = await KV.get(KV_PREFIX.TOPIC + targetUid);
+                        if (String(canonicalTid || "") !== topicId) {
+                            try {
+                                await KV.delete(KV_PREFIX.THREAD + topicId);
+                            } catch (err) {
+                                AlertBus.dispatch(
+                                    `旧下行映射(Topic:${topicId})清理失败: ${err.message}`,
+                                    `stale_topic_${topicId}`
+                                );
+                            }
+
+                            await sendControlMessage({
+                                chat_id: MY_ID,
+                                message_thread_id: msg.message_thread_id,
+                                text: UI_TEXT.STALE_TOPIC_WARN
+                            }, TTL.DELETE_PANEL);
+                            return;
+                        }
+
+                        if (isCommand(cmd, TOPIC_ADMIN_COMMANDS.BAN)) {
+                            try {
+                                await Promise.all([
+                                    KV.put(KV_PREFIX.BAN + targetUid, "1"),
+                                    KV.put(KV_PREFIX.REMIND + targetUid, "1", { expirationTtl: TTL.COOLDOWN })
+                                ]);
+                            } catch (err) {
+                                throw new Error(`[CORE] 拉黑状态(UID:${targetUid})落盘失败: ${err.message}`);
+                            }
+
+                            const botMsg = await sendControlMessage({
+                                chat_id: MY_ID,
+                                message_thread_id: msg.message_thread_id,
+                                text: UI_TEXT.ADMIN_BANNED
+                            });
+
+                            if (botMsg.ok) {
+                                await deleteMessageNow(MY_ID, msg.message_id);
+                            }
+
+                            ctx.waitUntil(tg("sendMessage", {
+                                chat_id: targetUid,
+                                text: UI_TEXT.GUEST_BANNED
+                            }));
+                            return;
+                        }
+
+                        if (isCommand(cmd, TOPIC_ADMIN_COMMANDS.UNBAN)) {
+                            try {
+                                await KV.delete(KV_PREFIX.BAN + targetUid);
+                            } catch (err) {
+                                throw new Error(`[CORE] 解封状态(UID:${targetUid})清理失败: ${err.message}`);
+                            }
+
+                            const botMsg = await sendControlMessage({
+                                chat_id: MY_ID,
+                                message_thread_id: msg.message_thread_id,
+                                text: UI_TEXT.ADMIN_UNBANNED
+                            });
+
+                            if (botMsg.ok) {
+                                await deleteMessageNow(MY_ID, msg.message_id);
+                            }
+
+                            ctx.waitUntil(tg("sendMessage", {
+                                chat_id: targetUid,
+                                text: UI_TEXT.GUEST_UNBANNED
+                            }));
+                            return;
+                        }
+
+                        if (isCommand(cmd, TOPIC_ADMIN_COMMANDS.RESET_VERIFY)) {
+                            try {
+                                await Promise.all([
+                                    KV.delete(KV_PREFIX.VERIFY + targetUid),
+                                    KV.delete(KV_PREFIX.VWAIT + targetUid)
+                                ]);
+                            } catch (err) {
+                                throw new Error(`[CORE] 重置验证(UID:${targetUid})失败: ${err.message}`);
+                            }
+
+                            const botMsg = await sendControlMessage({
+                                chat_id: MY_ID,
+                                message_thread_id: msg.message_thread_id,
+                                text: UI_TEXT.ADMIN_VERIFY_RESET
+                            });
+
+                            if (botMsg.ok) {
+                                await deleteMessageNow(MY_ID, msg.message_id);
+                            }
+
+                            ctx.waitUntil(tg("sendMessage", {
+                                chat_id: targetUid,
+                                text: UI_TEXT.GUEST_VERIFY_RESET
+                            }));
+                            return;
+                        }
+
+                        if (cmd) {
+                            const botMsg = await sendControlMessage({
+                                chat_id: MY_ID,
+                                message_thread_id: msg.message_thread_id,
+                                text: "⚠️ 未识别的包厢指令。可用：/ban /拉黑、/unban /解封、/resetverify /重置验证"
+                            }, TTL.DELETE_SHORT);
+
+                            if (botMsg.ok) {
+                                await deleteMessageNow(MY_ID, msg.message_id);
+                            }
+                            return;
+                        }
+
+                        const res = await tg("copyMessage", {
+                            chat_id: targetUid,
+                            from_chat_id: MY_ID,
+                            message_id: msg.message_id
+                        });
+
+                        if (!res.ok) {
+                            const err = parseErr(res);
+
+                            if (err.action === "SILENT") {
+                                const isSys =
+                                    msg.forum_topic_closed ||
+                                    msg.forum_topic_created ||
+                                    msg.forum_topic_edited ||
+                                    (!msg.text && !msg.photo && !msg.document && !msg.video && !msg.voice && !msg.sticker);
+
+                                if (isSys) return;
+
+                                AlertBus.dispatch(
+                                    `消息类型(UID:${targetUid})限制复制: ${err.desc}`,
+                                    `copy_${targetUid}`
+                                );
+                                return;
+                            }
+
+                            if (err.action === "CORE") {
+                                throw new Error(`[CORE] 转发访客(UID:${targetUid})失败: ${err.desc}`);
+                            }
+
+                            if (err.action === "TERMINAL") {
+                                throw new Error(`[TERMINAL] 转发访客(UID:${targetUid})被拒: ${err.desc}`);
+                            }
+
+                            AlertBus.dispatch(
+                                `发往访客(UID:${targetUid})降级阻断: ${err.desc}`,
+                                `fwd_${targetUid}`
+                            );
+                            return;
+                        }
+
+                        if (res.result?.message_id) {
+                            try {
+                                await KV.put(
+                                    KV_PREFIX.MSG + msg.message_id,
+                                    `${targetUid}_${res.result.message_id}`,
+                                    { expirationTtl: TTL.MSG }
+                                );
+                            } catch (err) {
+                                throw new Error(`[CORE] 消息映射(UID:${targetUid})落盘失败: ${err.message}`);
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if (msg.chat.type === "private") {
+                    const uid = chatId;
+                    const isBanned = await KV.get(KV_PREFIX.BAN + uid);
+                    if (isBanned === "1") {
+                        try {
+                            if (!(await KV.get(KV_PREFIX.REMIND + uid))) {
+                                await KV.put(KV_PREFIX.REMIND + uid, "1", { expirationTtl: TTL.COOLDOWN });
+                                ctx.waitUntil(tg("sendMessage", {
+                                    chat_id: uid,
+                                    text: UI_TEXT.GUEST_BANNED
+                                }));
+                            }
+                        } catch (err) {
+                            ctx.waitUntil(tg("sendMessage", {
+                                chat_id: uid,
+                                text: UI_TEXT.GUEST_BANNED
+                            }));
+                            AlertBus.dispatch(
+                                `访客(UID:${uid})拒收冷却锁失败: ${err.message}`,
+                                `remind_fail_${uid}`
+                            );
+                        }
+                        return;
+                    }
+
+                    const verifiedRaw = await KV.get(KV_PREFIX.VERIFY + uid);
+                    const verifiedState = parseVerifyState(verifiedRaw);
+
+                    if (isCommand(cmd, GUEST_COMMANDS.START)) {
+                        if (isVerifiedState(verifiedState)) {
+                            if (!verifiedState.donePrompted) {
+                                try {
+                                    await KV.put(KV_PREFIX.VERIFY + uid, serializeVerifyState({
+                                        ok: true,
+                                        donePrompted: true
+                                    }));
+                                } catch (err) {
+                                    AlertBus.dispatch(
+                                        `已验证提示状态(UID:${uid})写入失败: ${err.message}`,
+                                        `vdone_${uid}`,
+                                        false
+                                    );
+                                }
+
+                                await tg("sendMessage", {
+                                    chat_id: uid,
+                                    text: UI_TEXT.VERIFY_DONE
+                                });
+                            }
+                            return;
+                        }
+
+                        const waitingRaw = await KV.get(KV_PREFIX.VWAIT + uid);
+                        let waiting = parseVerifyWaitState(waitingRaw);
+
+                        if (isVerifyWaitActive(waiting) && waiting?.code) {
+                            if (!waiting.startWarned) {
+                                waiting.startWarned = true;
+                                try {
+                                    await KV.put(KV_PREFIX.VWAIT + uid, serializeVerifyWaitState(waiting), {
+                                        expirationTtl: verifyWaitTtl()
+                                    });
+                                } catch (err) {
+                                    AlertBus.dispatch(
+                                        `验证二次提醒状态(UID:${uid})写入失败: ${err.message}`,
+                                        `vstart_${uid}`,
+                                        false
+                                    );
+                                }
+
+                                await tg("sendMessage", {
+                                    chat_id: uid,
+                                    text: UI_TEXT.VERIFY_START_WAIT
+                                });
+                            }
+                            return;
+                        }
+
+
+                        clearNeedStartWarn(uid);
+
+                        const code = makeVerifyCode();
+                        waiting = buildVerifyWaitState(code);
+
+                        try {
+                            await KV.put(KV_PREFIX.VWAIT + uid, serializeVerifyWaitState(waiting), {
+                                expirationTtl: verifyWaitTtl()
+                            });
+                        } catch (err) {
+                            throw new Error(`[CORE] 验证窗口(UID:${uid})创建失败: ${err.message}`);
+                        }
+
+                        const verifyPromptMsg = verifyTextWithCode(UI_TEXT.VERIFY_PROMPT(waiting.code), waiting.code);
+                        const verifyPromptRes = await tg("sendMessage", {
+                            chat_id: uid,
+                            text: verifyPromptMsg.text,
+                            entities: verifyPromptMsg.entities
+                        });
+                        if (!verifyPromptRes.ok) {
+                            throw new Error(`[CORE] 验证码(UID:${uid})发送失败: ${verifyPromptRes.description || "unknown"}; verify code send failed`);
+                        }
+                        return;
+                    }
+
+                    if (cmd && !isCommand(cmd, GUEST_COMMANDS.START)) {
+                        return;
+                    }
+
+                    if (!isVerifiedState(verifiedState)) {
+                        const waitingRaw = await KV.get(KV_PREFIX.VWAIT + uid);
+                        const waiting = parseVerifyWaitState(waitingRaw);
+
+                        if (waitingRaw && waiting?.code) {
+                            if (!isVerifyWaitActive(waiting)) {
+                                const expiredWarnCount = Math.max(0, Number(waiting.expiredWarnCount || 0) || 0);
+                                if (expiredWarnCount < 1) {
+                                    waiting.expiredWarnCount = expiredWarnCount + 1;
+                                    try {
+                                        await KV.put(KV_PREFIX.VWAIT + uid, serializeVerifyWaitState(waiting), {
+                                            expirationTtl: verifyWaitTtl()
+                                        });
+                                    } catch (err) {
+                                        AlertBus.dispatch(
+                                            `验证码过期提醒计数(UID:${uid})写入失败: ${err.message}`,
+                                            `vexpired_${uid}`,
+                                            false
+                                        );
+                                    }
+
+                                    await tg("sendMessage", {
+                                        chat_id: uid,
+                                        text: UI_TEXT.VERIFY_EXPIRED
+                                    });
+                                }
+                                return;
+                            }
+
+                            if (normalizeVerifyCode(rawText) === waiting.code) {
+                                try {
+                                    await KV.put(KV_PREFIX.VERIFY + uid, serializeVerifyState({
+                                        ok: true,
+                                        donePrompted: false
+                                    }));
+                                } catch (err) {
+                                    throw new Error(`[CORE] 验证状态(UID:${uid})落盘失败: ${err.message}`);
+                                }
+
+                                clearNeedStartWarn(uid);
+
+                                await tg("sendMessage", {
+                                    chat_id: uid,
+                                    text: UI_TEXT.VERIFY_OK
+                                });
+                                return;
+                            }
+
+                            const wrongWarnCount = Math.max(0, Number(waiting.wrongWarnCount || 0) || 0);
+                            if (wrongWarnCount < 2) {
+                                waiting.wrongWarnCount = wrongWarnCount + 1;
+                                try {
+                                    await KV.put(KV_PREFIX.VWAIT + uid, serializeVerifyWaitState(waiting), {
+                                        expirationTtl: verifyWaitTtl()
+                                    });
+                                } catch (err) {
+                                    AlertBus.dispatch(
+                                        `验证码错误提醒计数(UID:${uid})写入失败: ${err.message}`,
+                                        `vwrong_${uid}`,
+                                        false
+                                    );
+                                }
+
+                                const verifyWrongMsg = verifyTextWithCode(UI_TEXT.VERIFY_WRONG(waiting.code), waiting.code);
+                                await tg("sendMessage", {
+                                    chat_id: uid,
+                                    text: verifyWrongMsg.text,
+                                    entities: verifyWrongMsg.entities
+                                });
+                            }
+                            return;
+                        }
+
+                        if (shouldSendNeedStart(uid)) {
+                            await tg("sendMessage", {
+                                chat_id: uid,
+                                text: UI_TEXT.VERIFY_NEED_START
+                            });
+                        }
+                        return;
+                    }
+
+                    if (await isGuestRateLimited(uid)) {
+                        return;
+                    }
+
+                    let threadId = normalizeThreadId(await KV.get(KV_PREFIX.TOPIC + uid));
+
+                    const buildTopic = async () => {
+                        const topicKey = KV_PREFIX.TOPIC + uid;
+                        const lockKey = topicLockKey(uid);
+
+                        const existedBefore = normalizeThreadId(await KV.get(topicKey));
+                        if (existedBefore) {
+                            return existedBefore;
+                        }
+
+                        const lockSeen = await KV.get(lockKey);
+                        if (lockSeen) {
+                            await sleep(TOPIC_LOCK_WAIT_MS);
+                            const waitedTid = normalizeThreadId(await KV.get(topicKey));
+                            if (waitedTid) {
+                                return waitedTid;
+                            }
+                        }
+
+                        try {
+                            await KV.put(lockKey, "1", { expirationTtl: TOPIC_LOCK_TTL });
+                        } catch (err) {
+                            AlertBus.dispatch(
+                                `建房软锁(UID:${uid})写入失败: ${err.message}`,
+                                `topic_lock_${uid}`
+                            );
+                        }
+
+                        const existedAfterLock = normalizeThreadId(await KV.get(topicKey));
+                        if (existedAfterLock) {
+                            return existedAfterLock;
+                        }
+
+                        const rawName = String(msg.from?.first_name || "User").replace(/\s+/g, " ").trim() || "User";
+                        const topicName = `${rawName} | ${uid}`.slice(0, 128);
+
+                        const tr = await tg("createForumTopic", {
+                            chat_id: MY_ID,
+                            name: topicName
+                        });
+
+                        if (!tr.ok) {
+                            const topicErr = parseErr(tr);
+                            if (topicErr.action === "CORE") {
+                                throw new Error(`[CORE] 建房(UID:${uid})失败: ${topicErr.desc}`);
+                            }
+                            if (topicErr.action === "TERMINAL") {
+                                throw new Error(`[TERMINAL] 建房(UID:${uid})失败: ${topicErr.desc}`);
+                            }
+                            throw new Error(`[CORE] 建房(UID:${uid})失败: ${topicErr.desc}`);
+                        }
+
+                        const newTid = normalizeThreadId(tr.result?.message_thread_id);
+                        if (!newTid) {
+                            throw new Error(`[CORE] 建房(UID:${uid})未返回有效 Topic ID`);
+                        }
+
+                        const cleanupLeakedTopic = async () => {
+                            try {
+                                await KV.delete(KV_PREFIX.THREAD + newTid);
+                            } catch (e) {
+                                // best-effort
+                            }
+                            await deleteTopicNow(newTid);
+                        };
+
+                        const checkOld = normalizeThreadId(await KV.get(KV_PREFIX.TOPIC + uid));
+                        if (checkOld) {
+                            ctx.waitUntil(cleanupLeakedTopic());
+                            return checkOld;
+                        }
+
+                        try {
+                            await Promise.all([
+                                KV.put(KV_PREFIX.TOPIC + uid, newTid),
+                                KV.put(KV_PREFIX.THREAD + newTid, uid)
+                            ]);
+                        } catch (err) {
+                            throw new Error(`[CORE] 建房映射(UID:${uid})落盘失败: ${err.message}`);
+                        }
+
+                        const finalTid = normalizeThreadId(await KV.get(KV_PREFIX.TOPIC + uid));
+                        if (finalTid && finalTid !== newTid) {
+                            ctx.waitUntil(cleanupLeakedTopic());
+                            return finalTid;
+                        }
+
+                        return newTid;
+                    };
+
+                    if (threadId) {
+                        const reverseUid = await KV.get(KV_PREFIX.THREAD + threadId);
+
+                        if (String(reverseUid || "") === uid) {
+                            // 正常双向映射，直接使用
+                        } else if (!reverseUid) {
+                            const cutover = await KV.get(orphanFixMarkKey(threadId));
+
+                            if (cutover) {
+                                try {
+                                    await Promise.all([
+                                        KV.delete(KV_PREFIX.TOPIC + uid),
+                                        KV.delete(orphanFixMarkKey(threadId))
+                                    ]);
+                                } catch (err) {
+                                    throw new Error(`[CORE] 切换标记(UID:${uid})清理失败: ${err.message}`);
+                                }
+                                threadId = null;
+                            } else {
+                                try {
+                                    await KV.put(KV_PREFIX.THREAD + threadId, uid);
+                                } catch (err) {
+                                    throw new Error(`[CORE] 反向映射(UID:${uid},Topic:${threadId})补建失败: ${err.message}`);
+                                }
+                            }
+                        } else {
+                            try {
+                                await KV.delete(KV_PREFIX.TOPIC + uid);
+                            } catch (err) {
+                                throw new Error(`[CORE] 冲突映射(UID:${uid})清理失败: ${err.message}`);
+                            }
+                            threadId = null;
+                        }
+                    }
+
+                    let topicJustCreated = false;
+                    if (!threadId) {
+                        threadId = normalizeThreadId(await buildTopic());
+                        topicJustCreated = true;
+                    }
+
+                    if (!isValidThreadId(threadId)) {
+                        throw new Error(`[CORE] 投递访客(UID:${uid})前缺少有效 Topic ID，已阻止消息落入总控制室`);
+                    }
+
+                    if (topicJustCreated) {
+                        const ready = await ensureTopicReady(threadId);
+                        if (!ready) {
+                            throw new Error(`[CORE] 新建包厢(UID:${uid},Topic:${threadId})就绪探测失败`);
+                        }
+                    }
+
+                    const fwdParams = withRequiredThread({
+                        chat_id: MY_ID,
+                        from_chat_id: uid,
+                        message_id: msg.message_id
+                    }, threadId, `投递访客(UID:${uid})`);
+
+                    const fwd = await tg("forwardMessage", fwdParams);
+                    await assertForwardLandedInThread(fwd, threadId, uid, "投递访客");
+
+                    if (!fwd.ok) {
+                        const err = parseErr(fwd);
+
+                        if (err.action === "HEAL") {
+                            try {
+                                await Promise.all([
+                                    KV.delete(KV_PREFIX.TOPIC + uid),
+                                    threadId ? KV.delete(KV_PREFIX.THREAD + threadId) : Promise.resolve(),
+                                    threadId ? KV.delete(orphanFixMarkKey(threadId)) : Promise.resolve()
+                                ]);
+                            } catch (err2) {
+                                throw new Error(`[CORE] 死链映射(UID:${uid})清理失败: ${err2.message}`);
+                            }
+
+                            const retryTid = normalizeThreadId(await buildTopic());
+                            if (!isValidThreadId(retryTid)) {
+                                throw new Error(`[CORE] 自愈建房(UID:${uid})未得到有效 Topic ID，已阻止消息落入总控制室`);
+                            }
+                            const retryReady = await ensureTopicReady(retryTid);
+                            if (!retryReady) {
+                                throw new Error(`[CORE] 自愈建房(UID:${uid},Topic:${retryTid})就绪探测失败`);
+                            }
+
+                            const retryFwd = await tg("forwardMessage", withRequiredThread({
+                                chat_id: MY_ID,
+                                from_chat_id: uid,
+                                message_id: msg.message_id
+                            }, retryTid, `自愈重发(UID:${uid})`));
+                            await assertForwardLandedInThread(retryFwd, retryTid, uid, "自愈重发");
+
+                            if (!retryFwd.ok) {
+                                const retryErr = parseErr(retryFwd);
+
+                                if (retryErr.action === "CORE") {
+                                    throw new Error(`[CORE] 自愈重发(UID:${uid})失败: ${retryErr.desc}`);
+                                }
+
+                                if (retryErr.action === "TERMINAL") {
+                                    throw new Error(`[TERMINAL] 自愈重发(UID:${uid})被拒: ${retryErr.desc}`);
+                                }
+
+                                AlertBus.dispatch(
+                                    `自愈重投(UID:${uid})降级失败: ${retryErr.desc}`,
+                                    `heal_${uid}`
+                                );
+                                throw new Error(`[CORE] 自愈重发(UID:${uid})失败: ${retryErr.desc}; heal retry forward not delivered`);
+                            }
+
+                            ctx.waitUntil((async () => {
+                                try {
+                                    await tg("unpinAllForumTopicMessages", {
+                                        chat_id: MY_ID,
+                                        message_thread_id: Number(retryTid)
+                                    });
+                                } catch (e) {
+                                    // best-effort
+                                }
+                            })());
+                            return;
+                        }
+
+                        if (err.action === "CORE") {
+                            throw new Error(`[CORE] 投递访客(UID:${uid})消息失败: ${err.desc}`);
+                        }
+
+                        if (err.action === "TERMINAL") {
+                            throw new Error(`[TERMINAL] 投递访客(UID:${uid})被拒: ${err.desc}`);
+                        }
+
+                        AlertBus.dispatch(
+                            `投递(UID:${uid})降级失败: ${err.desc}`,
+                            `fwd_in_${uid}`
+                        );
+                    }
+
+                    if (topicJustCreated && fwd.ok) {
+                        ctx.waitUntil((async () => {
+                            try {
+                                await tg("unpinAllForumTopicMessages", {
+                                    chat_id: MY_ID,
+                                    message_thread_id: Number(threadId)
+                                });
+                            } catch (e) {
+                                // best-effort
+                            }
+                        })());
+                    }
+                }
+            };
+
+            await processUpdate();
+
+            try {
+                if (b.update_id !== undefined) {
+                    await KV.put(KV_PREFIX.UPD + b.update_id, "1", { expirationTtl: TTL.UPD });
+                }
+            } catch (err) {
+                AlertBus.dispatch(
+                    `${UI_TEXT.ERR_UPD}: ${err.message}`,
+                    `upd_${b.update_id}`
+                );
+            } finally {
+                if (b.update_id !== undefined) {
+                    setHotUpdateState(b.update_id, "done");
+                }
+            }
+
+        } catch (e) {
+            if (b?.update_id !== undefined) {
+                clearHotUpdateState(b.update_id);
+            }
+
+            console.error("RelayBot V1.0 捕获:", e);
+            const errStr = String(e?.stack || e?.message || e);
+            const dedupeKey = "out_" + hashStr(errStr);
+
+            if (BOT_TOKEN && MY_ID) {
+                if (errStr.includes("[CORE]")) {
+                    AlertBus.dispatch(
+                        `🚨 RelayBot 主链路崩溃重试\n\n异常详情：${errStr.substring(0, 500)}`,
+                        dedupeKey,
+                        true
+                    );
+                    return new Response("Core Execution Failed", { status: 500 });
+                }
+
+                if (errStr.includes("[TERMINAL]")) {
+                    AlertBus.dispatch(
+                        `🚨 RelayBot 终端熔断告警 (不重试)\n\n异常详情：${errStr.substring(0, 500)}`,
+                        dedupeKey,
+                        false
+                    );
+                    return new Response("OK");
+                }
+
+                if (errStr.includes("[WARN]")) {
+                    AlertBus.dispatch(
+                        `⚠️ RelayBot 系统降级告警\n\n异常详情：${errStr.substring(0, 500)}`,
+                        dedupeKey,
+                        false
+                    );
+                    return new Response("OK");
+                }
+
+                AlertBus.dispatch(
+                    `🚨 RelayBot 未知系统崩溃 (触发保底重试)\n\n捕获到未分类错误：\n${errStr.substring(0, 500)}`,
+                    dedupeKey,
+                    true
+                );
+                return new Response("Unknown System Error", { status: 500 });
+            }
+
+            return new Response("Error", { status: 500 });
+        }
+
+        return new Response("OK");
+    }
+};

@@ -62,7 +62,7 @@ export const UI_TEXT = {
     VERIFY_OK: "✅ 验证成功，现在可以直接发送消息。",
     VERIFY_DONE: "✅ 你已完成验证，现在可以直接发送消息。",
     ADMIN_VERIFY_RESET: "✅ 已重置该访客的验证状态。",
-    GUEST_VERIFY_RESET: "⚠️ 你的验证状态已被重置，请重新发送 /start 或 /开始 完成验证。",
+    GUEST_VERIFY_RESET: "⚠️ 你的验证状态已被重置，请重新发送 /start 完成验证。",
     VERIFY_EXPIRED: "❌ 验证码已过期，请重新发送 /start 或 /开始 获取新的验证码。",
     VERIFY_NEED_START: "⚠️ 请先发送 /start 或 /开始 获取验证码。",
     CMD_HELP:

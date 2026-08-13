@@ -1,13 +1,34 @@
 # RelayBot
 
-RelayBot 是一个轻量的 Telegram 私聊转发 Bot，基于 Cloudflare Workers 与 Workers KV 运行。访客私聊机器人，消息自动转发到管理群的独立话题；管理员在话题内回复，访客即可收到。单管理员、低维护、免服务器。
+> 轻量、免服务器的 Telegram 私聊留言转发 Bot，基于 Cloudflare Workers 与 Workers KV，单文件部署。
+
+![License](https://img.shields.io/badge/license-MIT-green)
+![Platform](https://img.shields.io/badge/platform-Cloudflare%20Workers-orange)
+![Version](https://img.shields.io/badge/version-v1.0-blue)
+
+访客私聊机器人，消息自动转发到管理群的独立话题；管理员在话题内回复，访客即可收到。单管理员、低维护、零服务器。
+
+## 免责声明
+
+本项目仅为个人学习与技术交流而制作，所有代码、脚本、配置和文档均不构成任何形式的保证。使用者应自行评估风险并承担全部后果，作者不承担因使用、部署、修改或传播本项目而产生的任何直接或间接损失。请勿用于违反 Telegram 服务条款、当地法律法规或侵害他人权益的场景。
+
+本项目不提供任何技术支持承诺，仅供学习参考。
 
 ## 快速安装
 
-1. 打开 Cloudflare Workers & Pages，新建 Worker。
+需要准备：
+
+- BotFather 创建的 Telegram Bot Token
+- 已开启 Topics 的 Telegram 超级群
+- 管理员个人 Telegram 数字 UID
+- Cloudflare 账户
+
+部署步骤：
+
+1. 在 Cloudflare Workers & Pages 新建 Worker。
 2. 新建 KV Namespace，命名为 `BOT_KV`。
 3. 在 Worker 的 Bindings 中绑定 `BOT_KV`，绑定变量名填写 `KV`（源码读取 `env.KV`，不能填 `BOT_KV`）。
-4. 在 Worker 的 Settings / Variables and Secrets 配置：
+4. 配置环境变量：
 
 | 变量名 | 类型 | 值 | 说明 |
 | --- | --- | --- | --- |
@@ -65,6 +86,16 @@ flowchart LR
 | `/ban` 或 `/拉黑` | 封禁指定访客 |
 | `/unban` 或 `/解封` | 解封指定访客 |
 | `/resetverify` 或 `/重置验证` | 重置访客验证状态 |
+
+## 项目结构
+
+```text
+relay/
+├── relay_v1.txt              # 主程序（单文件 Worker 源码）
+├── README.md                 # 本说明
+├── _codex_workspace/tests/    # 静态检查与行为测试
+└── .gitignore
+```
 
 ## 数据与稳定性
 

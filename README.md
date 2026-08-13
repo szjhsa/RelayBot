@@ -1,18 +1,22 @@
+<div align="center">
+
 # RelayBot
 
-> 轻量、免服务器的 Telegram 私聊留言转发 Bot，基于 Cloudflare Workers 与 Workers KV，单文件部署。
+**轻量、免服务器的 Telegram 私聊留言转发 Bot，基于 Cloudflare Workers 与 Workers KV，单文件部署。**
 
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Cloudflare%20Workers-orange)
 ![Version](https://img.shields.io/badge/version-v1.0-blue)
 
+</div>
+
 访客私聊机器人，消息自动转发到管理群的独立话题；管理员在话题内回复，访客即可收到。单管理员、低维护、零服务器。
 
 ## 免责声明
 
-本项目仅为个人学习与技术交流而制作，所有代码、脚本、配置和文档均不构成任何形式的保证。使用者应自行评估风险并承担全部后果，作者不承担因使用、部署、修改或传播本项目而产生的任何直接或间接损失。请勿用于违反 Telegram 服务条款、当地法律法规或侵害他人权益的场景。
+> 本项目仅为个人学习与技术交流而制作，所有代码、脚本、配置和文档均不构成任何形式的保证。使用者应自行评估风险并承担全部后果，作者不承担因使用、部署、修改或传播本项目而产生的任何直接或间接损失。请勿用于违反 Telegram 服务条款、当地法律法规或侵害他人权益的场景。
 
-本项目不提供任何技术支持承诺，仅供学习参考。
+> 本项目不提供任何技术支持承诺，仅供学习参考。
 
 ## 快速安装
 
